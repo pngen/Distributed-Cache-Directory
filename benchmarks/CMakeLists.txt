@@ -1,0 +1,2 @@
+add_executable(distributed-cache-directory-benchmark benchmark.cpp)
+target_link_libraries(distributed-cache-directory-benchmark PRIVATE DistributedCacheDirectory::distributedcachedirectory)

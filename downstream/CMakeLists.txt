@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.24)
+project(dcd_consumer LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+find_package(DistributedCacheDirectory CONFIG REQUIRED)
+add_executable(dcd_consumer main.cpp)
+target_link_libraries(dcd_consumer PRIVATE DistributedCacheDirectory::distributedcachedirectory)

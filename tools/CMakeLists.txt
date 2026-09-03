@@ -1,0 +1,8 @@
+add_executable(distributed-cache-directory-coordinator coordinator.cpp)
+target_link_libraries(distributed-cache-directory-coordinator PRIVATE DistributedCacheDirectory::distributedcachedirectory)
+
+add_executable(distributed-cache-directory-worker worker.cpp)
+target_link_libraries(distributed-cache-directory-worker PRIVATE DistributedCacheDirectory::distributedcachedirectory)
+
+add_executable(distributed-cache-directory cli.cpp)
+target_link_libraries(distributed-cache-directory PRIVATE DistributedCacheDirectory::distributedcachedirectory)

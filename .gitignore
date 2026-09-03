@@ -1,0 +1,29 @@
+# Build output
+/build/
+/build-*/
+/install/
+/*-install/
+downstream/build/
+*.obj
+*.o
+*.lib
+*.pdb
+*.ilk
+*.exe
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+
+# Build artifacts / generated
+*.d
+*.log
+*.tmp
+*.rej
+*.orig
+*.bin
+.vs/
+.idea/
+.vscode/
+compile_commands.json
