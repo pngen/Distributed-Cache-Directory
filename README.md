@@ -209,4 +209,5 @@ target_link_libraries(my_app PRIVATE DistributedCacheDirectory::distributedcache
 - unknown physical facts remain UNKNOWN.
 
 ## License
+
 Apache License 2.0. Copyright 2026 Summon Software Labs. No telemetry transmission.
