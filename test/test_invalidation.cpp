@@ -18,5 +18,13 @@ int main() {
   auto t2 = tst::register_one(dcd::StateId(2), dcd::StateGeneration(1), "wa");
   auto il = t2.dir.invalidate_location(dcd::LocationId(1), tst::env(t2.dir, t2.boot, 2), "loc gone");
   DCD_CHECK(il.ok);
+  // ---- regression: an invalidated record stays INVALIDATED through later updates ----
+  {
+    auto rid = t.dir.records().front().record_id;
+    auto ud = t.dir.update_health(rid, dcd::Health::DEGRADED, tst::env(t.dir, t.boot, 3));
+    DCD_CHECK(ud.ok);
+    DCD_CHECK(t.dir.record(rid).value().lifecycle == dcd::LifecycleState::INVALIDATED);
+    DCD_CHECK(!t.dir.record(rid).value().current);
+  }
   return dcdtest::summary("test_invalidation");
 }

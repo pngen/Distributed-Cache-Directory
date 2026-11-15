@@ -59,6 +59,9 @@ void CoordinatorServer::handle_connection(transport::TcpStream&& stream) {
       case protocol::MessageKind::HELLO: {
         WorkerSession s;
         if (!protocol::deserialize_hello(payload, s)) { respond_error(ch, DirectoryError::PROTOCOL_VIOLATION, "malformed hello"); break; }
+        // One connection carries one worker session: its loss is observed when
+        // this connection closes, so a second session must not replace it.
+        if (have_boot) { respond_error(ch, DirectoryError::PROTOCOL_VIOLATION, "session already established on this connection"); break; }
         auto r = dir_->register_worker_session(s);
         if (!r) { respond_error(ch, r.error, r.error_text); break; }
         boot = s.boot; have_boot = true;
@@ -123,14 +126,16 @@ void CoordinatorServer::handle_connection(transport::TcpStream&& stream) {
         protocol::InvalidateMsg m;
         if (!protocol::deserialize_invalidate(payload, m)) { respond_error(ch, DirectoryError::PROTOCOL_VIOLATION, "malformed invalidate"); break; }
         Result<InvalidateResult> r;
+        bool known_kind = true;
         switch (m.kind) {
           case 0: r = dir_->invalidate_state(StateId(m.target), StateGeneration(m.generation), m.env, m.reason); break;
           case 1: r = dir_->invalidate_cache(CacheId(m.target), m.env, m.reason); break;
           case 2: r = dir_->invalidate_replica(ReplicaId(m.target), m.env, m.reason); break;
           case 3: r = dir_->invalidate_location(LocationId(m.target), m.env, m.reason); break;
           case 4: r = dir_->invalidate_worker_boot(WorkerBootId(m.target), m.env, m.reason); break;
-          default: respond_error(ch, DirectoryError::PROTOCOL_VIOLATION, "bad invalidation kind"); break;
+          default: known_kind = false; respond_error(ch, DirectoryError::PROTOCOL_VIOLATION, "bad invalidation kind"); break;
         }
+        if (!known_kind) break;  // exactly one response per request.
         if (!r.ok) { respond_error(ch, r.error, r.error_text); break; }
         respond_ack(ch, AckResult{true, r.value.message}); break;
       }

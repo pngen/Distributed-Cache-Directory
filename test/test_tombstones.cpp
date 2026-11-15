@@ -21,5 +21,46 @@ int main() {
   DCD_CHECK(okf.ok);
   DCD_CHECK(okf.value.state_generation == dcd::StateGeneration(2));
   DCD_CHECK(!t.dir.covered_by_tombstone(dcd::TombstoneTarget{tb.target.kind, dcd::StateId(1), {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, 2}));
+  // ---- regression: a rejected update leaves the record unchanged ----
+  {
+    auto tid = t.dir.records().front().record_id;  // the tombstoned generation-1 record.
+    const auto before = t.dir.record(tid).value();
+    auto up = t.dir.update_health(tid, dcd::Health::UNAVAILABLE, tst::env(t.dir, t.boot, 5));
+    DCD_CHECK(!up.ok);
+    DCD_CHECK(up.error == dcd::DirectoryError::INVALID_STATE_TRANSITION);
+    DCD_CHECK(t.dir.record(tid).value().health == before.health);
+    DCD_CHECK(t.dir.record(tid).value().lifecycle == dcd::LifecycleState::TOMBSTONED);
+  }
+  // ---- regression: tombstones of other kinds are enforced, not only recorded ----
+  {
+    auto t2 = tst::register_one(dcd::StateId(5), dcd::StateGeneration(1), "wa");
+    dcd::TombstoneRecord rt; rt.tombstone_id = dcd::TombstoneId(2); rt.target.kind = dcd::TombstoneKind::REPLICA; rt.target.replica = t2.replica;
+    rt.target.generation_floor = 0; rt.epoch = t2.dir.epoch(); rt.worker_boot = t2.boot; rt.reason = "replica retired"; rt.timestamp_ns = dcd::wall_clock_ns();
+    DCD_CHECK(t2.dir.tombstone(rt).ok);
+    DCD_CHECK(t2.dir.covered_by_tombstone(rt.target));
+    // The replica's current record is tombstoned...
+    DCD_CHECK(!t2.dir.records().front().current);
+    DCD_CHECK(t2.dir.records().front().lifecycle == dcd::LifecycleState::TOMBSTONED);
+    // ...and that replica generation cannot be republished, even for a newer state generation.
+    dcd::DirectoryRecord again = tst::make_record(t2); again.state_generation = dcd::StateGeneration(2);
+    auto ra = t2.dir.register_entry(again);
+    DCD_CHECK(!ra.ok);
+    DCD_CHECK(ra.error == dcd::DirectoryError::TOMBSTONED);
+    // A newer replica generation is above the tombstone's floor.
+    again.replica_generation = dcd::ReplicaGeneration(1);
+    DCD_CHECK(t2.dir.register_entry(again).ok);
+  }
+  {
+    // A worker-boot tombstone covers every record of that incarnation.
+    auto t3 = tst::register_one(dcd::StateId(6), dcd::StateGeneration(1), "wa");
+    dcd::TombstoneRecord wt; wt.tombstone_id = dcd::TombstoneId(3); wt.target.kind = dcd::TombstoneKind::WORKER_BOOT; wt.target.worker_boot = t3.boot;
+    wt.epoch = t3.dir.epoch(); wt.worker_boot = t3.boot; wt.reason = "incarnation retired"; wt.timestamp_ns = dcd::wall_clock_ns();
+    DCD_CHECK(t3.dir.tombstone(wt).ok);
+    DCD_CHECK(!t3.dir.records().front().current);
+    dcd::DirectoryRecord more = tst::make_record(t3); more.state_id = dcd::StateId(7);
+    auto rm = t3.dir.register_entry(more);
+    DCD_CHECK(!rm.ok);
+    DCD_CHECK(rm.error == dcd::DirectoryError::TOMBSTONED);
+  }
   return dcdtest::summary("test_tombstones");
 }

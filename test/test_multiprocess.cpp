@@ -1,6 +1,8 @@
 #include "distributedcachedirectory/directory.hpp"
 #include "test_framework.hpp"
 #include "mp_child.hpp"
+#include "distributedcachedirectory/client.hpp"
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -20,164 +22,241 @@ static std::string wait_for(Child& c, const std::string& marker, int timeout_ms 
   return acc;
 }
 
-// Send a command line and wait for a response line (one of a set of prefixes).
+// Send a command line and return the worker's response line: the first complete
+// line that starts with OK, ERR or RESULT. Candidate detail lines are skipped.
 static std::string send_cmd(Child& c, const std::string& cmd, int timeout_ms = 5000) {
   c.write_stdin(cmd + "\r\n");
   std::string acc;
   int elapsed = 0;
   while (elapsed < timeout_ms) {
     acc += c.read_available();
-    // response lines end with newline; wait until we get one complete line matching a token.
-    if (acc.find("OK ") != std::string::npos || acc.find("ERR ") != std::string::npos || acc.find("RESULT ") != std::string::npos) {
-      std::size_t e = acc.find("\n");
-      if (e != std::string::npos) return acc.substr(0, e);
-      // maybe no newline yet but token present; return what we have
-      return acc;
+    std::size_t start = 0;
+    for (;;) {
+      const std::size_t e = acc.find('\n', start);
+      if (e == std::string::npos) break;
+      std::string line = acc.substr(start, e - start);
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      if (line.rfind("OK ", 0) == 0 || line.rfind("ERR ", 0) == 0 || line.rfind("RESULT ", 0) == 0) return line;
+      start = e + 1;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(30)); elapsed += 30;
   }
   return acc;
 }
 
+static bool is_ok(const std::string& resp) { return resp.rfind("OK ", 0) == 0; }
+static bool has(const std::string& resp, const std::string& what) { return resp.find(what) != std::string::npos; }
+
+// Parse "DCD_PORT=<n>" out of the coordinator's start-up output.
+static unsigned short parse_port(const std::string& out) {
+  const std::size_t p = out.find("DCD_PORT=");
+  if (p == std::string::npos) return 0;
+  return static_cast<unsigned short>(std::strtoul(out.c_str() + p + 9, nullptr, 10));
+}
+
 int main(int argc, char** argv) {
   const std::string coord = (argc > 1) ? argv[1] : DCD_COORDINATOR_EXE;
   const std::string worker = (argc > 2) ? argv[2] : DCD_WORKER_EXE;
-  std::string persist = "mp_proof.bin";
+  const std::string persist = "mp_proof.bin";
+  const std::string savePath = "mp_save.bin";
+  // State left by an aborted run must not be recovered by this one.
+  std::remove(persist.c_str()); std::remove(savePath.c_str());
   std::printf("multiprocess authority proof: coordinator=%s worker=%s\n", coord.c_str(), worker.c_str());
 
-  // 1. Start coordinator.
+  std::vector<Child*> children;
+  auto cleanup = [&]() { for (Child* c : children) c->kill(); std::remove(persist.c_str()); std::remove(savePath.c_str()); };
+
+  // 1. Start the coordinator.
   std::string cerr;
   Child coordc = Child::spawn(coord, {"--port", "0", "--persist", persist.c_str()}, cerr);
   if (!coordc.hproc) { std::printf("FAIL spawn coordinator: %s\n", cerr.c_str()); return 1; }
-  std::string co = wait_for(coordc, "DCD_PORT=", 6000);
-  std::string port = "0", epochS = "1";
-  { std::size_t p = co.find("DCD_PORT="); if (p != std::string::npos) { std::string r = co.substr(p + 9); { std::size_t nl = r.find('\n'); port = (nl == std::string::npos) ? r : r.substr(0, nl); } } }
-  if (port == "0" || port.empty()) { std::printf("FAIL no port from coordinator; out=%s\n", co.c_str()); coordc.kill(); return 1; }
-  std::string addr = "127.0.0.1:" + port;
-  std::printf("PASS coordinator started at %s\n", addr.c_str());
+  children.push_back(&coordc);
+  const unsigned short port = parse_port(wait_for(coordc, "DCD_EPOCH=", 6000));
+  if (port == 0) { std::printf("FAIL no port from coordinator\n"); cleanup(); return 1; }
+  const std::string addr = "127.0.0.1:" + std::to_string(port);
+  std::printf("coordinator started at %s\n", addr.c_str());
 
-  auto mk_worker = [&](const std::vector<std::string>& args) -> Child {
-    std::string e; Child c = Child::spawn(worker, args, e);
-    if (!c.hproc) std::printf("FAIL spawn worker: %s\n", e.c_str());
-    return c;
+  Child a, b, a2, stale_worker, coord2, b2;
+  auto mk_worker = [&](Child& slot, const std::vector<std::string>& args) {
+    std::string e; slot = Child::spawn(worker, args, e);
+    if (!slot.hproc) std::printf("FAIL spawn worker: %s\n", e.c_str());
+    else children.push_back(&slot);
+    return slot.hproc != nullptr;
   };
 
-  // 2. Worker A and Worker B.
-  Child a = mk_worker({"--coordinator", addr, "--boot", "101", "--worker", "1", "--node", "1", "--tag", "wa"});
-  Child b = mk_worker({"--coordinator", addr, "--boot", "202", "--worker", "2", "--node", "2", "--tag", "wb"});
-  std::string ra = wait_for(a, "READY", 5000), rb = wait_for(b, "READY", 5000);
-  std::printf("A: %s\n", ra.c_str());
-  std::printf("B: %s\n", rb.c_str());
+  // 2. Worker A (boot 101) and Worker B (boot 202), each a real OS process.
+  DCD_CHECK(mk_worker(a, {"--coordinator", addr, "--boot", "101", "--worker", "1", "--node", "1", "--tag", "wa"}));
+  DCD_CHECK(mk_worker(b, {"--coordinator", addr, "--boot", "202", "--worker", "2", "--node", "2", "--tag", "wb"}));
+  DCD_CHECK(has(wait_for(a, "READY", 5000), "READY epoch=1"));
+  DCD_CHECK(has(wait_for(b, "READY", 5000), "READY epoch=1"));
 
-  // 3. Worker A registers cache/location/replica/entry (X, gen 1) + lease.
-  send_cmd(a, "register-cache 1 0 0 0 4096");
-  send_cmd(a, "register-location 5 2 0 0 host:/a 4096");
-  send_cmd(a, "register-replica 9 5 1 7 1");
-  send_cmd(a, "register-entry 100 1 2 1 7 9 5 1 0 2 4096 - 1 1 1 2");
-  // Worker B registers the same state/gen as a second replica.
-  send_cmd(b, "register-cache 2 4 2 2 4096");
-  send_cmd(b, "register-location 6 3 2 0 fs:/b 4096");
-  send_cmd(b, "register-replica 10 6 2 8 1");
-  send_cmd(b, "register-entry 100 1 2 2 8 10 6 2 0 3 4096 - 1 1 1 2");
+  // 3. Each worker registers its cache, location and replica, then the same
+  //    state (100, generation 1) as its own replica.
+  //    register-entry: state gen kind cache entry replica location device domain bytes digest locgen repgen entgen fence
+  DCD_CHECK(is_ok(send_cmd(a, "register-cache 1 0 2 4096")));
+  DCD_CHECK(is_ok(send_cmd(a, "register-location 5 2 0 host:/a 4096")));
+  DCD_CHECK(is_ok(send_cmd(a, "register-replica 9 5 1 7 1")));
+  DCD_CHECK(is_ok(send_cmd(a, "register-entry 100 1 2 1 7 9 5 0 2 4096 - 1 1 1 2")));
+  DCD_CHECK(is_ok(send_cmd(b, "register-cache 2 4 3 4096")));
+  DCD_CHECK(is_ok(send_cmd(b, "register-location 6 3 0 fs:/b 4096")));
+  DCD_CHECK(is_ok(send_cmd(b, "register-replica 10 6 2 8 1")));
+  DCD_CHECK(is_ok(send_cmd(b, "register-entry 100 1 2 2 8 10 6 0 3 4096 - 1 1 1 2")));
 
-  // 4. Query from B: expect two candidates.
-  auto q1 = send_cmd(b, "query 100 wb");
+  // 4. Both replicas are discovered.
+  const std::string q1 = send_cmd(b, "query 100 wb");
   std::printf("query after dual register: %s\n", q1.c_str());
-  std::printf("%s\n", (q1.find("count=2") != std::string::npos) ? "PASS dual-replica discovery" : "FAIL dual-replica discovery");
+  DCD_CHECK(has(q1, "outcome=FOUND_MULTIPLE") && has(q1, "count=2"));
 
-  // 5. Degrade replica 1 (Worker A's copy). Determine its record id from a query first.
-  auto qa = send_cmd(a, "query 100 wa");
-  // record id is not directly printed; degrade via worker A's update-health on the record it registered.
-  // The record id was auto-assigned; request via query shows replica. We target by querying from B and using record? Simpler: degrade via update-health on record id 1 (first record).
-  // We don't know record id; use a query that lists candidate replication. We'll capture replica ordering and issue update-health to the first record using a fresh query through A.
-  auto dup_before = send_cmd(b, "query 100 wb");
-  std::printf("query before degrade: %s\n", dup_before.c_str());
-  // degrade replica 1 by record id discovered through a coordinator-side query is not exposed as id in worker print; instead we use the invalidation path via worker A update-health on record 1.
-  auto dh = send_cmd(a, "update-health 1 1 3");
-  std::printf("degrade replica 1: %s\n", dh.c_str());
+  // 5. Worker A degrades its own copy (record 1 is the first registered entry).
+  //    A degraded copy is still a candidate.
+  DCD_CHECK(is_ok(send_cmd(a, "update-health 1 1 3")));
+  DCD_CHECK(has(send_cmd(b, "query 100 wb"), "count=2"));
 
   // 6. Save.
-  std::string savePath = "mp_save.bin";
-  auto sv = send_cmd(a, "save " + savePath);
-  std::printf("save: %s\n", sv.c_str());
+  DCD_CHECK(is_ok(send_cmd(a, "save " + savePath)));
 
-  // 7. Kill worker A as a real OS process.
+  // 7. Kill Worker A as a real OS process. The coordinator observes the loss
+  //    when the connection closes; A's copy then needs revalidation and only
+  //    B's replica is offered.
   a.terminate();
-  std::printf("killed Worker A\n");
-  std::this_thread::sleep_for(std::chrono::milliseconds(800));
-
-  // 8. Query from B: Worker B's replica should remain available; Worker A's record marked.
-  auto q_after_death = send_cmd(b, "query 100 wb");
+  std::string q_after_death;
+  for (int waited = 0; waited < 5000; waited += 50) {
+    q_after_death = send_cmd(b, "query 100 wb");
+    if (has(q_after_death, "count=1")) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
   std::printf("query after A death: %s\n", q_after_death.c_str());
-  std::printf("%s\n", (q_after_death.find("count=1") != std::string::npos || q_after_death.find("count=0") != std::string::npos) ? "PASS surviving replica handled after A death" : "FAIL surviving replica handled after A death");
+  DCD_CHECK(has(q_after_death, "count=1"));
 
-  // 9. Restart Worker A with a fresh boot (103) and publish a fresh generation (X gen 2).
-  Child a2 = mk_worker({"--coordinator", addr, "--boot", "103", "--worker", "1", "--node", "1", "--tag", "wa"});
-  std::string ra2 = wait_for(a2, "READY", 5000);
-  send_cmd(a2, "register-cache 1 0 0 0 4096");
-  send_cmd(a2, "register-location 5 2 0 0 host:/a2 4096");
-  send_cmd(a2, "register-replica 9 5 1 7 1");
-  send_cmd(a2, "register-entry 100 2 2 1 7 9 5 1 0 2 4096 - 1 2 1 3");
-  std::printf("restarted Worker A with fresh boot 103; published X Generation 2\n");
+  // 8. Worker A restarts with a fresh boot (103), re-registers what its lost
+  //    incarnation held and publishes generation 2.
+  DCD_CHECK(mk_worker(a2, {"--coordinator", addr, "--boot", "103", "--worker", "1", "--node", "1", "--tag", "wa"}));
+  DCD_CHECK(has(wait_for(a2, "READY", 5000), "READY epoch=1"));
+  DCD_CHECK(is_ok(send_cmd(a2, "register-cache 1 0 2 4096")));
+  DCD_CHECK(is_ok(send_cmd(a2, "register-location 5 2 0 host:/a2 4096")));
+  DCD_CHECK(is_ok(send_cmd(a2, "register-replica 9 5 1 7 1")));
+  DCD_CHECK(is_ok(send_cmd(a2, "register-entry 100 2 2 1 7 9 5 0 2 4096 - 1 2 1 3")));
 
-  // 10. Replay stale mutations (using the OLD boot 101). Spawn a replay worker.
-  Child rp = mk_worker({"--coordinator", addr, "--boot", "101", "--worker", "1", "--node", "1", "--tag", "wa", "--epoch", "1"});
-  std::string rrp = wait_for(rp, "READY", 5000);
-  // register stale generation (gen 1) -> expect rejection.
-  auto s1 = send_cmd(rp, "register-entry 100 1 2 1 7 9 5 1 0 2 4096 - 1 1 1 2");
-  // stale health update on record.
-  auto s2 = send_cmd(rp, "update-health 9 1 9");
-  // stale lease renewal.
-  auto s3 = send_cmd(rp, "renew-lease 1 9");
-  // stale invalidation.
-  auto s4 = send_cmd(rp, "invalidate 0 100 1 9 stale-invalidate");
-  // stale tombstone.
-  auto s5 = send_cmd(rp, "tombstone 1 100 1 stale-tombstone");
-  // stale cache registration.
-  auto s6 = send_cmd(rp, "register-cache 99 0 0 0 4096");
+  // 9. The lost incarnation cannot come back: a worker process that presents
+  //    the old boot 101 is refused a session.
+  DCD_CHECK(mk_worker(stale_worker, {"--coordinator", addr, "--boot", "101", "--worker", "1", "--node", "1", "--tag", "wa"}));
+  const std::string stale_hello = wait_for(stale_worker, "ERR HELLO", 5000);
+  std::printf("stale worker: %s", stale_hello.c_str());
+  DCD_CHECK(has(stale_hello, "ERR HELLO"));
+  DCD_CHECK(!has(stale_hello, "READY"));
 
-  auto check = [](const std::string& resp, const std::string& name) {
-    bool rejected = resp.find("ERR ") != std::string::npos;
-    if (rejected) std::printf("PASS %s rejected: %s\n", name.c_str(), resp.c_str());
-    else std::printf("FAIL %s was NOT rejected: %s\n", name.c_str(), resp.c_str());
-    return rejected;
+  // 10. Replay every stale mutation class over a real connection, carrying the
+  //     lost incarnation's envelope, and check each is rejected with its class.
+  std::string err;
+  dcd::client::DcdClient observer = dcd::client::DcdClient::connect("127.0.0.1", port, err);
+  dcd::client::DcdClient zombie = dcd::client::DcdClient::connect("127.0.0.1", port, err);
+  DCD_CHECK(observer.connected());
+  DCD_CHECK(zombie.connected());
+  dcd::CoordinatorEpoch epoch;
+  dcd::WorkerSession obs_session; obs_session.boot = dcd::WorkerBootId(900); obs_session.worker = dcd::WorkerId(9); obs_session.node = dcd::NodeId(9); obs_session.tag = "observer";
+  DCD_CHECK(observer.hello(obs_session, epoch, err));
+  DCD_CHECK(epoch == dcd::CoordinatorEpoch(1));
+
+  dcd::WorkerSession old_session; old_session.boot = dcd::WorkerBootId(101); old_session.worker = dcd::WorkerId(1); old_session.node = dcd::NodeId(1); old_session.tag = "wa";
+  dcd::CoordinatorEpoch ignored;
+  DCD_CHECK(!zombie.hello(old_session, ignored, err));
+  DCD_CHECK(zombie.last_error() == dcd::DirectoryError::STALE_WORKER_BOOT);
+
+  dcd::AuthorityEnvelope stale; stale.epoch = epoch; stale.boot = dcd::WorkerBootId(101); stale.fence = 99;
+  auto rejected_as = [&](bool sent_ok, dcd::DirectoryError expected, const char* what) {
+    const bool ok = !sent_ok && zombie.last_error() == expected;
+    std::printf("%s %s: %s %s\n", ok ? "PASS" : "FAIL", what, dcd::to_string(zombie.last_error()), zombie.last_error_text().c_str());
+    DCD_CHECK_MSG(ok, what);
   };
-  check(s1, "stale registration");
-  check(s2, "stale health update");
-  check(s3, "stale lease renewal");
-  check(s4, "stale invalidation");
-  check(s5, "stale tombstone");
-  check(s6, "stale cache registration");
+  // registration of the old generation and of the fresh one
+  dcd::DirectoryRecord sr; sr.state_id = dcd::StateId(100); sr.state_generation = dcd::StateGeneration(1); sr.kind = dcd::StateKind::TENSOR_STATE;
+  sr.cache = dcd::CacheId(1); sr.entry = dcd::CacheEntryId(7); sr.replica = dcd::ReplicaId(9); sr.location = dcd::LocationId(5);
+  sr.node = dcd::NodeId(1); sr.worker = dcd::WorkerId(1); sr.worker_boot = dcd::WorkerBootId(101); sr.domain = dcd::MemoryDomain::HOST_MEMORY; sr.logical_bytes = 4096;
+  sr.health = dcd::Health::HEALTHY; sr.freshness = dcd::Freshness::CURRENT; sr.integrity = dcd::Integrity::VERIFIED; sr.reachability = dcd::Reachability::REACHABLE;
+  sr.authority = stale;
+  rejected_as(zombie.register_entry(sr, err), dcd::DirectoryError::NO_AUTHORITY, "stale registration");
+  sr.state_generation = dcd::StateGeneration(2);
+  rejected_as(zombie.register_entry(sr, err), dcd::DirectoryError::NO_AUTHORITY, "stale registration of the current generation");
+  // updates: record 1 was the lost incarnation's own, record 3 is the fresh incarnation's
+  rejected_as(zombie.update_health(dcd::DirectoryRecordId(1), dcd::Health::HEALTHY, stale, err), dcd::DirectoryError::NO_AUTHORITY, "stale health update on its own record");
+  rejected_as(zombie.update_freshness(dcd::DirectoryRecordId(1), dcd::Freshness::CURRENT, stale, err), dcd::DirectoryError::NO_AUTHORITY, "stale freshness update on its own record");
+  rejected_as(zombie.update_health(dcd::DirectoryRecordId(3), dcd::Health::UNAVAILABLE, stale, err), dcd::DirectoryError::STALE_WORKER_BOOT, "stale health update on the fresh record");
+  rejected_as(zombie.update_integrity(dcd::DirectoryRecordId(3), dcd::Integrity::CORRUPT, stale, err), dcd::DirectoryError::STALE_WORKER_BOOT, "stale integrity update on the fresh record");
+  rejected_as(zombie.update_reachability(dcd::DirectoryRecordId(3), dcd::Reachability::UNREACHABLE, stale, err), dcd::DirectoryError::STALE_WORKER_BOOT, "stale reachability update on the fresh record");
+  // a lease renewal (no lease can be created over the wire, so this one is unknown)
+  rejected_as(zombie.renew_lease(dcd::LeaseId(1), stale, err), dcd::DirectoryError::INVALID_IDENTITY, "lease renewal for an unknown lease");
+  // invalidation of the fresh state, cache, replica, location and incarnation
+  dcd::protocol::InvalidateMsg im; im.env = stale; im.reason = "stale-invalidate";
+  im.kind = 0; im.target = 100; im.generation = 2;
+  rejected_as(zombie.invalidate(im, err), dcd::DirectoryError::NO_AUTHORITY, "stale state invalidation");
+  im.generation = 0;
+  im.kind = 1; im.target = 1; rejected_as(zombie.invalidate(im, err), dcd::DirectoryError::NO_AUTHORITY, "stale cache invalidation");
+  im.kind = 2; im.target = 9; rejected_as(zombie.invalidate(im, err), dcd::DirectoryError::NO_AUTHORITY, "stale replica invalidation");
+  im.kind = 3; im.target = 5; rejected_as(zombie.invalidate(im, err), dcd::DirectoryError::NO_AUTHORITY, "stale location invalidation");
+  im.kind = 4; im.target = 103; rejected_as(zombie.invalidate(im, err), dcd::DirectoryError::NO_AUTHORITY, "stale worker-boot invalidation");
+  // tombstone of the fresh generation
+  dcd::TombstoneRecord tb; tb.tombstone_id = dcd::TombstoneId(1); tb.target.kind = dcd::TombstoneKind::STATE; tb.target.state = dcd::StateId(100); tb.target.generation_floor = 2;
+  tb.epoch = epoch; tb.worker_boot = dcd::WorkerBootId(101); tb.reason = "stale-tombstone"; tb.timestamp_ns = dcd::wall_clock_ns();
+  rejected_as(zombie.tombstone(tb, err), dcd::DirectoryError::NO_AUTHORITY, "stale tombstone");
+  // cache registration
+  dcd::CacheDescriptor sc; sc.cache_id = dcd::CacheId(99); sc.kind = dcd::CacheKind::PROCESS_LOCAL; sc.node = dcd::NodeId(1); sc.worker = dcd::WorkerId(1); sc.worker_boot = dcd::WorkerBootId(101);
+  sc.domain = dcd::MemoryDomain::HOST_MEMORY; sc.authority = stale;
+  rejected_as(zombie.register_cache(sc, err), dcd::DirectoryError::NO_AUTHORITY, "stale cache registration");
+  // a stale epoch is rejected before anything else
+  dcd::AuthorityEnvelope old_epoch = stale; old_epoch.epoch = dcd::CoordinatorEpoch(0); old_epoch.boot = dcd::WorkerBootId(103);
+  rejected_as(zombie.update_health(dcd::DirectoryRecordId(3), dcd::Health::UNAVAILABLE, old_epoch, err), dcd::DirectoryError::STALE_EPOCH, "stale-epoch update");
 
-  // 11. Query should select the current (gen 2) candidate.
-  auto q_final = send_cmd(b, "query 100 wb");
-  std::printf("final query: %s\n", q_final.c_str());
+  // 11. None of the replays changed current state: exactly the fresh
+  //     incarnation's generation-2 record is offered, still healthy and current.
+  dcd::DirectoryQuery q; q.query_id = dcd::QueryId(1); q.exact_state = true; q.state = dcd::StateId(100); q.requester_process_tag = "observer";
+  dcd::QueryResult final_result;
+  DCD_CHECK(observer.query(q, final_result, err));
+  DCD_CHECK_EQ(final_result.candidates.size(), 1u);
+  if (final_result.candidates.size() == 1u) {
+    const auto& rec = final_result.candidates[0].record;
+    DCD_CHECK(rec.record_id == dcd::DirectoryRecordId(3));
+    DCD_CHECK(rec.state_generation == dcd::StateGeneration(2));
+    DCD_CHECK(rec.worker_boot == dcd::WorkerBootId(103));
+    DCD_CHECK(rec.current);
+    DCD_CHECK(rec.lifecycle == dcd::LifecycleState::AVAILABLE);
+    DCD_CHECK(rec.health == dcd::Health::HEALTHY && rec.integrity == dcd::Integrity::VERIFIED && rec.reachability == dcd::Reachability::REACHABLE);
+  }
 
-  // 12. Duplicate conflicting registration from the replay worker (gen 2 under old boot) rejected.
-  auto dup = send_cmd(rp, "register-entry 100 2 2 1 7 9 5 1 0 2 4096 - 1 2 1 9");
-  check(dup, "conflicting duplicate registration");
+  // 12. One response per request: an invalidation of an unknown kind is
+  //     answered once, so the next request on the connection gets its own
+  //     answer; and one connection carries one session.
+  dcd::protocol::InvalidateMsg bad; bad.kind = 9; bad.target = 100; bad.generation = 2; bad.env = stale; bad.reason = "bad-kind";
+  DCD_CHECK(!observer.invalidate(bad, err));
+  DCD_CHECK(observer.last_error() == dcd::DirectoryError::PROTOCOL_VIOLATION);
+  dcd::QueryResult after_bad;
+  DCD_CHECK_MSG(observer.query(q, after_bad, err), err);
+  DCD_CHECK_EQ(after_bad.candidates.size(), 1u);
+  dcd::WorkerSession second; second.boot = dcd::WorkerBootId(901); second.worker = dcd::WorkerId(9); second.node = dcd::NodeId(9); second.tag = "observer";
+  DCD_CHECK(!observer.hello(second, ignored, err));
+  DCD_CHECK(observer.last_error() == dcd::DirectoryError::PROTOCOL_VIOLATION);
 
-  // 13. Save final and terminate coordinator; start a fresh coordinator that recovers.
-  send_cmd(b, "save " + savePath);
-  coordc.terminate();
-  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  // 13. Save the final state, stop the coordinator, and start a fresh one that
+  //     recovers it under a new epoch. A surviving worker gets a session, and the
+  //     recovered copies are not offered until they are revalidated.
+  DCD_CHECK(is_ok(send_cmd(b, "save " + savePath)));
+  observer.close(); zombie.close();
   coordc.kill();
+  coord2 = Child::spawn(coord, {"--port", "0", "--persist", savePath}, cerr);
+  DCD_CHECK(coord2.hproc != nullptr);
+  if (coord2.hproc) children.push_back(&coord2);
+  const std::string co2 = coord2.hproc ? wait_for(coord2, "DCD_EPOCH=", 6000) : std::string();
+  const unsigned short port2 = parse_port(co2);
+  DCD_CHECK(port2 != 0);
+  DCD_CHECK(has(co2, "DCD_EPOCH=2"));
+  if (port2 != 0) {
+    const std::string addr2 = "127.0.0.1:" + std::to_string(port2);
+    DCD_CHECK(mk_worker(b2, {"--coordinator", addr2, "--boot", "202", "--worker", "2", "--node", "2", "--tag", "wb"}));
+    DCD_CHECK(has(wait_for(b2, "READY", 5000), "READY epoch=2"));
+    const std::string q_recover = send_cmd(b2, "query 100 wb");
+    std::printf("post-recovery query: %s\n", q_recover.c_str());
+    DCD_CHECK(has(q_recover, "outcome=STALE_ONLY") && has(q_recover, "count=0"));
+  }
 
-  Child coord2 = Child::spawn(coord, {"--port", "0", "--persist", savePath.c_str()}, cerr);
-  if (!coord2.hproc) { std::printf("FAIL spawn fresh coordinator: %s\n", cerr.c_str()); return 1; }
-  std::string co2 = wait_for(coord2, "DCD_PORT=", 6000);
-  std::string port2 = "0";
-  { std::size_t p = co2.find("DCD_PORT="); if (p != std::string::npos) { std::string rr = co2.substr(p+9); { std::size_t nl = rr.find('\n'); port2 = (nl == std::string::npos) ? rr : rr.substr(0, nl); } } }
-  if (port2.empty() || port2=="0") { std::printf("FAIL fresh coordinator no port: %s\n", co2.c_str()); coord2.kill(); return 1; }
-  std::string addr2 = "127.0.0.1:" + port2;
-  // Fresh query via a survivor worker (B) revalidates.
-  Child b2 = mk_worker({"--coordinator", addr2, "--boot", "202", "--worker", "2", "--node", "2", "--tag", "wb"});
-  std::string rbb = wait_for(b2, "READY", 5000);
-  auto q_recover = send_cmd(b2, "query 100 wb");
-  std::printf("post-recovery query: %s\n", q_recover.c_str());
-  std::printf("%s\n", (q_recover.find("count=0") != std::string::npos || q_recover.find("RESULT ") != std::string::npos) ? "PASS coordinator recovery allows revalidation" : "FAIL coordinator recovery");
-
-  b.kill(); a2.kill(); rp.kill(); b2.kill(); coord2.kill();
-  std::remove(persist.c_str()); std::remove("mp_save.bin");
+  cleanup();
   return dcdtest::summary("test_multiprocess");
 }

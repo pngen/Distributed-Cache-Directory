@@ -105,6 +105,14 @@ bool hard_reject(const DirectoryRecord& r, const DirectoryQuery& q, RejectionRea
   if (r.reachability == Reachability::UNREACHABLE) { reason = RejectionReason::UNREACHABLE; return true; }
   if (r.freshness == Freshness::STALE) { reason = RejectionReason::STALE_RECORD; return true; }
   if (r.has_lease && r.lease.state == LeaseState::EXPIRED) { reason = RejectionReason::EXPIRED_LEASE; return true; }
+  // A copy whose owner was lost, or that was recovered, is not available until
+  // it is revalidated; evidence that was never established is not availability.
+  if (r.lifecycle == LifecycleState::STALE) { reason = RejectionReason::STALE_RECORD; return true; }
+  if (r.lifecycle == LifecycleState::UNREACHABLE) { reason = RejectionReason::UNREACHABLE; return true; }
+  if (r.freshness == Freshness::REVALIDATION_REQUIRED || r.reachability == Reachability::REVALIDATION_REQUIRED ||
+      r.freshness == Freshness::UNKNOWN || r.reachability == Reachability::UNKNOWN || r.integrity == Integrity::UNKNOWN) {
+    reason = RejectionReason::MISSING_REQUIRED_EVIDENCE; return true;
+  }
   return false;
 }
 
@@ -129,6 +137,10 @@ Result<WorkerSession> Directory::register_worker_session(const WorkerSession& se
   auto it = workers_.find(session.boot);
   if (it != workers_.end() && it->second.live)
     return Result<WorkerSession>::failure(DirectoryError::INVALID_IDENTITY, "worker boot already live");
+  // A WorkerBootId names one incarnation. Once that incarnation was lost the
+  // same id never becomes a live source again.
+  if (it != workers_.end())
+    return Result<WorkerSession>::failure(DirectoryError::STALE_WORKER_BOOT, "worker boot was lost; a restart needs a fresh WorkerBootId");
   bool restart = false;
   for (const auto& kv : workers_) if (kv.second.worker == session.worker && kv.second.boot != session.boot) restart = true;
   if (restart) ++accounting_.worker_restarts;
@@ -180,8 +192,11 @@ Result<CacheDescriptor> Directory::register_cache(const CacheDescriptor& cache) 
   if (!worker_live(cache.worker_boot)) return Result<CacheDescriptor>::failure(DirectoryError::NO_AUTHORITY, "worker session not live");
   auto it = caches_.find(cache.cache_id);
   if (it != caches_.end()) {
-    if (it->second.worker_boot != cache.worker_boot) return Result<CacheDescriptor>::failure(DirectoryError::STALE_WORKER_BOOT, "cache owned by another incarnation");
-    if (cache.authority.fence < it->second.authority.fence) return Result<CacheDescriptor>::failure(DirectoryError::STALE_AUTHORITY, "stale cache authority");
+    // Only a live incarnation holds a cache: one that was lost cannot fence the
+    // fresh incarnation re-registering it, and fences compare within one boot.
+    if (it->second.worker_boot != cache.worker_boot) {
+      if (worker_live(it->second.worker_boot)) return Result<CacheDescriptor>::failure(DirectoryError::STALE_WORKER_BOOT, "cache owned by another incarnation");
+    } else if (cache.authority.fence < it->second.authority.fence) return Result<CacheDescriptor>::failure(DirectoryError::STALE_AUTHORITY, "stale cache authority");
   }
   caches_[cache.cache_id] = cache;
   ++accounting_.registrations;
@@ -198,8 +213,9 @@ Result<LocationDescriptor> Directory::register_location(const LocationDescriptor
   if (!worker_live(loc.worker_boot)) return Result<LocationDescriptor>::failure(DirectoryError::NO_AUTHORITY, "worker session not live");
   auto it = locations_.find(loc.location_id);
   if (it != locations_.end()) {
-    if (it->second.worker_boot != loc.worker_boot) return Result<LocationDescriptor>::failure(DirectoryError::STALE_WORKER_BOOT, "location owned by another incarnation");
-    if (loc.authority.fence < it->second.authority.fence) return Result<LocationDescriptor>::failure(DirectoryError::STALE_AUTHORITY, "stale location authority");
+    if (it->second.worker_boot != loc.worker_boot) {
+      if (worker_live(it->second.worker_boot)) return Result<LocationDescriptor>::failure(DirectoryError::STALE_WORKER_BOOT, "location owned by another incarnation");
+    } else if (loc.authority.fence < it->second.authority.fence) return Result<LocationDescriptor>::failure(DirectoryError::STALE_AUTHORITY, "stale location authority");
     if (loc.generation.value() < it->second.generation.value()) return Result<LocationDescriptor>::failure(DirectoryError::STALE_GENERATION, "stale location generation");
   }
   locations_[loc.location_id] = loc;
@@ -215,7 +231,7 @@ Result<ReplicaDescriptor> Directory::register_replica(const ReplicaDescriptor& r
   if (replica.authority.epoch != epoch_) return Result<ReplicaDescriptor>::failure(DirectoryError::STALE_EPOCH, "stale epoch");
   if (!worker_live(replica.authority.boot)) return Result<ReplicaDescriptor>::failure(DirectoryError::NO_AUTHORITY, "worker session not live");
   auto it = replicas_.find(replica.replica_id);
-  if (it != replicas_.end() && it->second.authority.boot != replica.authority.boot)
+  if (it != replicas_.end() && it->second.authority.boot != replica.authority.boot && worker_live(it->second.authority.boot))
     return Result<ReplicaDescriptor>::failure(DirectoryError::STALE_WORKER_BOOT, "replica owned by another incarnation");
   replicas_[replica.replica_id] = replica;
   ++accounting_.registrations;
@@ -234,6 +250,7 @@ DirectoryError Directory::check_registration(const DirectoryRecord& record, std:
   if (record.location.is_null()) { why = "empty LocationId"; return DirectoryError::INVALID_IDENTITY; }
   if (record.authority.epoch != epoch_) { why = "stale epoch"; return DirectoryError::STALE_EPOCH; }
   if (!worker_live(record.authority.boot)) { why = "worker session not live"; return DirectoryError::NO_AUTHORITY; }
+  if (!record.record_id.is_null() && find_record_index(record.record_id) != static_cast<std::size_t>(-1)) { why = "record id already in use"; return DirectoryError::DUPLICATE_IDENTITY; }
 
   auto cit = caches_.find(record.cache);
   if (cit == caches_.end()) { why = "cache not registered"; return DirectoryError::MISSING_DEPENDENCY; }
@@ -250,8 +267,7 @@ DirectoryError Directory::check_registration(const DirectoryRecord& record, std:
   if (loc.domain != record.domain) { why = "domain mismatch"; return DirectoryError::DIMENSION_MISMATCH; }
   if (lit->second.reachability == Reachability::UNREACHABLE) { why = "location invalidated"; return DirectoryError::STALE_GENERATION; }
 
-  TombstoneTarget t; t.kind = TombstoneKind::STATE; t.state = record.state_id; t.generation_floor = record.state_generation.value();
-  if (covered_by_tombstone(t)) { why = "covered by state tombstone"; return DirectoryError::TOMBSTONED; }
+  if (auto tomb = check_tombstone(record); !tomb.ok) { why = tomb.error_text; return DirectoryError::TOMBSTONED; }
 
   auto cg = current_state_gen_.find(record.state_id);
   if (cg != current_state_gen_.end()) {
@@ -287,7 +303,9 @@ Result<DirectoryRecord> Directory::register_entry(const DirectoryRecord& record)
 }
 
 Result<DirectoryRecord> Directory::commit_record(DirectoryRecord record, bool supersede_older) {
-  if (record.record_id.is_null()) record.record_id = DirectoryRecordId(next_object_id());
+  // An assigned id never repeats one that is already in use.
+  while (record.record_id.is_null() || find_record_index(record.record_id) != static_cast<std::size_t>(-1))
+    record.record_id = DirectoryRecordId(next_object_id());
   if (record.created_ns == 0) record.created_ns = wall_clock_ns();
   record.updated_ns = wall_clock_ns();
   record.record_generation = RecordGeneration(directory_generation_.value() + 1);
@@ -334,6 +352,7 @@ bool can_lifecycle(LifecycleState from, LifecycleState to) {
 
 LifecycleState derive_lifecycle(const DirectoryRecord& r) {
   if (!r.current && r.lifecycle == LifecycleState::SUPERSEDED) return LifecycleState::SUPERSEDED;
+  if (r.lifecycle == LifecycleState::INVALIDATED) return LifecycleState::INVALIDATED;
   if (r.integrity == Integrity::CORRUPT) return LifecycleState::FAILED;
   if (r.integrity == Integrity::MISSING) return LifecycleState::MISSING;
   if (r.reachability == Reachability::UNREACHABLE) return LifecycleState::UNREACHABLE;
@@ -341,7 +360,6 @@ LifecycleState derive_lifecycle(const DirectoryRecord& r) {
   if (r.has_lease && r.lease.state == LeaseState::EXPIRED) return LifecycleState::EXPIRED;
   if (r.freshness == Freshness::STALE) return LifecycleState::STALE;
   if (r.health == Health::DEGRADED || r.reachability == Reachability::DEGRADED) return LifecycleState::DEGRADED;
-  if (r.lifecycle == LifecycleState::INVALIDATED) return LifecycleState::INVALIDATED;
   return LifecycleState::AVAILABLE;
 }
 }  // namespace
@@ -360,6 +378,7 @@ std::optional<DirectoryRecord> Directory::record(DirectoryRecordId id) const {
 DirectoryError Directory::check_update_authority(const DirectoryRecord& rec, const AuthorityEnvelope& env, std::string& why) const {
   if (env.epoch != epoch_) { why = "stale epoch"; return DirectoryError::STALE_EPOCH; }
   if (rec.authority.boot != env.boot) { why = "not the owning incarnation"; return DirectoryError::STALE_WORKER_BOOT; }
+  if (!worker_live(env.boot)) { why = "owning incarnation is not live"; return DirectoryError::NO_AUTHORITY; }
   if (env.fence < rec.authority.fence) { why = "stale authority fence"; return DirectoryError::STALE_AUTHORITY; }
   return DirectoryError::NONE;
 }
@@ -374,9 +393,10 @@ Result<DirectoryRecord> Directory::update_health(DirectoryRecordId id, Health h,
   if (e != DirectoryError::NONE) return Result<DirectoryRecord>::failure(e, why);
   auto& r = records_[i];
   auto from = r.lifecycle;
+  const Health previous = r.health;
   r.health = h;
   auto to = derive_lifecycle(r);
-  if (!can_lifecycle(from, to)) return Result<DirectoryRecord>::failure(DirectoryError::INVALID_STATE_TRANSITION, "illegal lifecycle transition");
+  if (!can_lifecycle(from, to)) { r.health = previous; return Result<DirectoryRecord>::failure(DirectoryError::INVALID_STATE_TRANSITION, "illegal lifecycle transition"); }
   r.lifecycle = to;
   r.authority.fence = env.fence;
   r.updated_ns = wall_clock_ns();
@@ -394,9 +414,10 @@ Result<DirectoryRecord> Directory::update_freshness(DirectoryRecordId id, Freshn
   if (e != DirectoryError::NONE) return Result<DirectoryRecord>::failure(e, why);
   auto& r = records_[i];
   auto from = r.lifecycle;
+  const Freshness previous = r.freshness;
   r.freshness = f;
   auto to = derive_lifecycle(r);
-  if (!can_lifecycle(from, to)) return Result<DirectoryRecord>::failure(DirectoryError::INVALID_STATE_TRANSITION, "illegal lifecycle transition");
+  if (!can_lifecycle(from, to)) { r.freshness = previous; return Result<DirectoryRecord>::failure(DirectoryError::INVALID_STATE_TRANSITION, "illegal lifecycle transition"); }
   r.lifecycle = to;
   r.authority.fence = env.fence;
   r.updated_ns = wall_clock_ns();
@@ -414,9 +435,10 @@ Result<DirectoryRecord> Directory::update_reachability(DirectoryRecordId id, Rea
   if (e != DirectoryError::NONE) return Result<DirectoryRecord>::failure(e, why);
   auto& r = records_[i];
   auto from = r.lifecycle;
+  const Reachability previous = r.reachability;
   r.reachability = reach;
   auto to = derive_lifecycle(r);
-  if (!can_lifecycle(from, to)) return Result<DirectoryRecord>::failure(DirectoryError::INVALID_STATE_TRANSITION, "illegal lifecycle transition");
+  if (!can_lifecycle(from, to)) { r.reachability = previous; return Result<DirectoryRecord>::failure(DirectoryError::INVALID_STATE_TRANSITION, "illegal lifecycle transition"); }
   r.lifecycle = to;
   r.authority.fence = env.fence;
   r.updated_ns = wall_clock_ns();
@@ -434,9 +456,10 @@ Result<DirectoryRecord> Directory::update_integrity(DirectoryRecordId id, Integr
   if (e != DirectoryError::NONE) return Result<DirectoryRecord>::failure(e, why);
   auto& r = records_[i];
   auto from = r.lifecycle;
+  const Integrity previous = r.integrity;
   r.integrity = integ;
   auto to = derive_lifecycle(r);
-  if (!can_lifecycle(from, to)) return Result<DirectoryRecord>::failure(DirectoryError::INVALID_STATE_TRANSITION, "illegal lifecycle transition");
+  if (!can_lifecycle(from, to)) { r.integrity = previous; return Result<DirectoryRecord>::failure(DirectoryError::INVALID_STATE_TRANSITION, "illegal lifecycle transition"); }
   r.lifecycle = to;
   r.authority.fence = env.fence;
   r.updated_ns = wall_clock_ns();
@@ -468,6 +491,7 @@ Result<CacheDescriptor> Directory::update_cache_health(CacheId id, Health h, Rea
   if (it == caches_.end()) return Result<CacheDescriptor>::failure(DirectoryError::INVALID_IDENTITY, "no such cache");
   if (env.epoch != epoch_) return Result<CacheDescriptor>::failure(DirectoryError::STALE_EPOCH, "stale epoch");
   if (it->second.worker_boot != env.boot) return Result<CacheDescriptor>::failure(DirectoryError::STALE_WORKER_BOOT, "cache owned by another incarnation");
+  if (!worker_live(env.boot)) return Result<CacheDescriptor>::failure(DirectoryError::NO_AUTHORITY, "owning incarnation is not live");
   if (env.fence < it->second.authority.fence) return Result<CacheDescriptor>::failure(DirectoryError::STALE_AUTHORITY, "stale authority");
   it->second.health = h;
   it->second.reachability = reach;
@@ -483,6 +507,7 @@ Result<CacheDescriptor> Directory::update_cache_capacity(CacheId id, std::uint64
   if (it == caches_.end()) return Result<CacheDescriptor>::failure(DirectoryError::INVALID_IDENTITY, "no such cache");
   if (env.epoch != epoch_) return Result<CacheDescriptor>::failure(DirectoryError::STALE_EPOCH, "stale epoch");
   if (it->second.worker_boot != env.boot) return Result<CacheDescriptor>::failure(DirectoryError::STALE_WORKER_BOOT, "cache owned by another incarnation");
+  if (!worker_live(env.boot)) return Result<CacheDescriptor>::failure(DirectoryError::NO_AUTHORITY, "owning incarnation is not live");
   if (env.fence < it->second.authority.fence) return Result<CacheDescriptor>::failure(DirectoryError::STALE_AUTHORITY, "stale authority");
   it->second.capacity = capacity; it->second.capacity_known = true;
   it->second.free_capacity = free_capacity; it->second.free_capacity_known = true;
@@ -501,7 +526,7 @@ Result<LeaseDescriptor> Directory::register_lease(const LeaseDescriptor& lease) 
   if (lease.authority.epoch != epoch_) return Result<LeaseDescriptor>::failure(DirectoryError::STALE_EPOCH, "stale epoch");
   if (!worker_live(lease.holder)) return Result<LeaseDescriptor>::failure(DirectoryError::NO_AUTHORITY, "holder not live");
   auto it = leases_.find(lease.lease_id);
-  if (it != leases_.end() && it->second.holder != lease.holder)
+  if (it != leases_.end() && it->second.holder != lease.holder && worker_live(it->second.holder))
     return Result<LeaseDescriptor>::failure(DirectoryError::STALE_WORKER_BOOT, "lease held by another incarnation");
   leases_[lease.lease_id] = lease;
   ++accounting_.registrations;
@@ -515,11 +540,13 @@ Result<LeaseDescriptor> Directory::renew_lease(LeaseId id, const AuthorityEnvelo
   if (it == leases_.end()) return Result<LeaseDescriptor>::failure(DirectoryError::INVALID_IDENTITY, "no such lease");
   if (env.epoch != epoch_) return Result<LeaseDescriptor>::failure(DirectoryError::STALE_EPOCH, "stale epoch");
   if (it->second.holder != env.boot) return Result<LeaseDescriptor>::failure(DirectoryError::STALE_WORKER_BOOT, "stale lease renewal from non-holder");
+  if (!worker_live(env.boot)) return Result<LeaseDescriptor>::failure(DirectoryError::NO_AUTHORITY, "lease holder is not live");
   if (env.fence <= it->second.authority.fence) return Result<LeaseDescriptor>::failure(DirectoryError::STALE_AUTHORITY, "stale lease authority");
   if (it->second.state == LeaseState::REVOKED) return Result<LeaseDescriptor>::failure(DirectoryError::FAILED_LEASE_VALIDATION, "lease revoked");
   auto& l = it->second;
+  const TimestampNs duration = l.expiry_ns - l.start_ns;  // measured before the start moves.
   l.start_ns = wall_clock_ns();
-  if (l.expires) l.expiry_ns = l.start_ns + (l.expiry_ns - l.start_ns);
+  if (l.expires) l.expiry_ns = l.start_ns + duration;
   l.state = LeaseState::ACTIVE;
   l.generation = LeaseGeneration(l.generation.value() + 1);
   l.authority.fence = env.fence;
@@ -532,7 +559,10 @@ Result<LeaseDescriptor> Directory::renew_lease(LeaseId id, const AuthorityEnvelo
 Result<AckResult> Directory::expire_lease(LeaseId id, const AuthorityEnvelope& env, const std::string& reason) {
   auto it = leases_.find(id);
   if (it == leases_.end()) return Result<AckResult>::failure(DirectoryError::INVALID_IDENTITY, "no such lease");
+  if (env.epoch != epoch_) return Result<AckResult>::failure(DirectoryError::STALE_EPOCH, "stale epoch");
   if (it->second.holder != env.boot) return Result<AckResult>::failure(DirectoryError::STALE_WORKER_BOOT, "stale lease expiry");
+  if (!worker_live(env.boot)) return Result<AckResult>::failure(DirectoryError::NO_AUTHORITY, "lease holder is not live");
+  if (env.fence < it->second.authority.fence) return Result<AckResult>::failure(DirectoryError::STALE_AUTHORITY, "stale lease authority");
   it->second.state = LeaseState::EXPIRED;
   it->second.authority.fence = env.fence;
   ++accounting_.updates;
@@ -542,9 +572,10 @@ Result<AckResult> Directory::expire_lease(LeaseId id, const AuthorityEnvelope& e
 }
 
 Result<AckResult> Directory::revoke_lease(LeaseId id, const AuthorityEnvelope& env, const std::string& reason) {
-  (void)env;
   auto it = leases_.find(id);
   if (it == leases_.end()) return Result<AckResult>::failure(DirectoryError::INVALID_IDENTITY, "no such lease");
+  if (env.epoch != epoch_) return Result<AckResult>::failure(DirectoryError::STALE_EPOCH, "stale epoch");
+  if (!worker_live(env.boot)) return Result<AckResult>::failure(DirectoryError::NO_AUTHORITY, "revocation author not live");
   it->second.state = LeaseState::REVOKED;
   ++accounting_.updates;
   recompute_accounting();
@@ -556,10 +587,10 @@ Result<AckResult> Directory::revoke_lease(LeaseId id, const AuthorityEnvelope& e
 
 Result<InvalidateResult> Directory::invalidate_state(StateId s, StateGeneration g, const AuthorityEnvelope& env, const std::string& reason) {
   if (env.epoch != epoch_) return Result<InvalidateResult>::failure(DirectoryError::STALE_EPOCH, "stale epoch");
+  if (!worker_live(env.boot)) return Result<InvalidateResult>::failure(DirectoryError::NO_AUTHORITY, "invalidation author not live");
   InvalidateResult out;
   for (auto& r : records_) {
     if (r.state_id == s && r.state_generation == g && r.current) {
-      if (r.authority.boot != env.boot && !worker_live(env.boot)) continue;
       r.current = false;
       r.lifecycle = LifecycleState::INVALIDATED;
       r.updated_ns = wall_clock_ns();
@@ -575,6 +606,7 @@ Result<InvalidateResult> Directory::invalidate_state(StateId s, StateGeneration 
 }
 Result<InvalidateResult> Directory::invalidate_location(LocationId loc, const AuthorityEnvelope& env, const std::string& reason) {
   if (env.epoch != epoch_) return Result<InvalidateResult>::failure(DirectoryError::STALE_EPOCH, "stale epoch");
+  if (!worker_live(env.boot)) return Result<InvalidateResult>::failure(DirectoryError::NO_AUTHORITY, "invalidation author not live");
   InvalidateResult out;
   for (auto& r : records_) {
     if (r.location == loc && r.current) { r.current = false; r.lifecycle = LifecycleState::INVALIDATED; r.reachability = Reachability::UNREACHABLE; r.updated_ns = wall_clock_ns(); ++out.affected_records; }
@@ -590,6 +622,7 @@ Result<InvalidateResult> Directory::invalidate_location(LocationId loc, const Au
 
 Result<InvalidateResult> Directory::invalidate_replica(ReplicaId rep, const AuthorityEnvelope& env, const std::string& reason) {
   if (env.epoch != epoch_) return Result<InvalidateResult>::failure(DirectoryError::STALE_EPOCH, "stale epoch");
+  if (!worker_live(env.boot)) return Result<InvalidateResult>::failure(DirectoryError::NO_AUTHORITY, "invalidation author not live");
   InvalidateResult out;
   for (auto& r : records_) {
     if (r.replica == rep && r.current) { r.current = false; r.lifecycle = LifecycleState::INVALIDATED; r.updated_ns = wall_clock_ns(); ++out.affected_records; }
@@ -603,6 +636,7 @@ Result<InvalidateResult> Directory::invalidate_replica(ReplicaId rep, const Auth
 
 Result<InvalidateResult> Directory::invalidate_cache(CacheId c, const AuthorityEnvelope& env, const std::string& reason) {
   if (env.epoch != epoch_) return Result<InvalidateResult>::failure(DirectoryError::STALE_EPOCH, "stale epoch");
+  if (!worker_live(env.boot)) return Result<InvalidateResult>::failure(DirectoryError::NO_AUTHORITY, "invalidation author not live");
   InvalidateResult out;
   for (auto& r : records_) {
     if (r.cache == c && r.current) { r.current = false; r.lifecycle = LifecycleState::INVALIDATED; r.updated_ns = wall_clock_ns(); ++out.affected_records; }
@@ -618,6 +652,7 @@ Result<InvalidateResult> Directory::invalidate_cache(CacheId c, const AuthorityE
 
 Result<InvalidateResult> Directory::invalidate_worker_boot(WorkerBootId b, const AuthorityEnvelope& env, const std::string& reason) {
   if (env.epoch != epoch_) return Result<InvalidateResult>::failure(DirectoryError::STALE_EPOCH, "stale epoch");
+  if (!worker_live(env.boot)) return Result<InvalidateResult>::failure(DirectoryError::NO_AUTHORITY, "invalidation author not live");
   InvalidateResult out;
   for (auto& r : records_) {
     if (r.worker_boot == b && r.current) { r.current = false; r.lifecycle = LifecycleState::INVALIDATED; r.reachability = Reachability::UNREACHABLE; r.updated_ns = wall_clock_ns(); ++out.affected_records; }
@@ -667,6 +702,33 @@ bool Directory::covered_by_tombstone(const TombstoneTarget& target) const {
   return false;
 }
 
+// Whether a record falls under a current tombstone of any kind that names one
+// of the record's own properties.
+Result<AckResult> Directory::check_tombstone(const DirectoryRecord& record) const {
+  const auto covered = [this](TombstoneKind kind, std::uint64_t generation, const auto& set_target) {
+    TombstoneTarget t; t.kind = kind; t.generation_floor = generation; set_target(t);
+    return covered_by_tombstone(t);
+  };
+  const char* by = nullptr;
+  const auto cit = caches_.find(record.cache);
+  const auto lit = locations_.find(record.location);
+  if (covered(TombstoneKind::STATE, record.state_generation.value(), [&](TombstoneTarget& t) { t.state = record.state_id; })) by = "state";
+  else if (covered(TombstoneKind::CACHE, cit == caches_.end() ? 0 : cit->second.generation.value(), [&](TombstoneTarget& t) { t.cache = record.cache; })) by = "cache";
+  else if (covered(TombstoneKind::ENTRY, record.entry_generation.value(), [&](TombstoneTarget& t) { t.entry = record.entry; })) by = "entry";
+  else if (covered(TombstoneKind::REPLICA, record.replica_generation.value(), [&](TombstoneTarget& t) { t.replica = record.replica; })) by = "replica";
+  else if (covered(TombstoneKind::LOCATION, record.location_generation.value(), [&](TombstoneTarget& t) { t.location = record.location; })) by = "location";
+  else if (!record.worker_boot.is_null() && covered(TombstoneKind::WORKER_BOOT, 0, [&](TombstoneTarget& t) { t.worker_boot = record.worker_boot; })) by = "worker boot";
+  else if (!record.node.is_null() && covered(TombstoneKind::NODE, 0, [&](TombstoneTarget& t) { t.node = record.node; })) by = "node";
+  else if (!record.device.is_null() && covered(TombstoneKind::DEVICE, 0, [&](TombstoneTarget& t) { t.device = record.device; })) by = "device";
+  else if (lit != locations_.end() && !lit->second.backend.is_null() &&
+           covered(TombstoneKind::BACKEND, 0, [&](TombstoneTarget& t) { t.backend = lit->second.backend; })) by = "backend";
+  else if (!record.compatibility.is_null() && covered(TombstoneKind::COMPATIBILITY, 0, [&](TombstoneTarget& t) { t.compatibility = record.compatibility; })) by = "compatibility";
+  else if (!record.policy_generation.is_null() && covered(TombstoneKind::POLICY, 0, [&](TombstoneTarget& t) { t.policy_generation = record.policy_generation; })) by = "policy";
+  else if (record.content_digest_known && covered(TombstoneKind::CONTENT, 0, [&](TombstoneTarget& t) { t.content = record.content_digest; })) by = "content";
+  if (by) return Result<AckResult>::failure(DirectoryError::TOMBSTONED, std::string("covered by ") + by + " tombstone");
+  return Result<AckResult>::success(AckResult{});
+}
+
 Result<AckResult> Directory::tombstone(const TombstoneRecord& tombstone) {
   if (tombstone.tombstone_id.is_null()) return Result<AckResult>::failure(DirectoryError::INVALID_IDENTITY, "empty TombstoneId");
   if (tombstone.epoch != epoch_) return Result<AckResult>::failure(DirectoryError::STALE_EPOCH, "stale epoch");
@@ -683,8 +745,7 @@ Result<AckResult> Directory::tombstone(const TombstoneRecord& tombstone) {
   tombstones_.push_back(tombstone);
   // Mark covered current records as TOMBSTONED and non-current if still current.
   for (auto& r : records_) {
-    if (tombstone.target.kind == TombstoneKind::STATE && r.state_id == tombstone.target.state &&
-        r.state_generation.value() <= tombstone.target.generation_floor) {
+    if (!check_tombstone(r).ok) {
       r.lifecycle = LifecycleState::TOMBSTONED;
       r.current = false;
     }
@@ -774,6 +835,14 @@ QueryResult Directory::query_impl(const DirectoryQuery& q, std::vector<std::size
       continue;
     }
     cand_idx.push_back(i);
+  }
+  // A required replica count is a hard requirement on the eligible set.
+  if (q.min_replica_count > cand_idx.size()) {
+    for (std::size_t i : cand_idx) {
+      const auto& rec = records_[i];
+      res.rejections.push_back(Rejection{rec.record_id, RejectionReason::NO_REQUIRED_REPLICA_COUNT, rec.state_id, rec.state_generation, rec.replica, rec.location});
+    }
+    cand_idx.clear();
   }
   for (std::size_t i : cand_idx) {
     Candidate c;

@@ -90,4 +90,43 @@ inline void register_extra(Topology& t, dcd::WorkerBootId boot, dcd::WorkerId wo
   t.dir.register_entry(rec);
 }
 
+// Register a worker session with one HOST_MEMORY cache, location and replica on
+// `dir`. Returns true when every registration was accepted.
+inline bool register_holder(dcd::Directory& dir, dcd::WorkerBootId boot, dcd::WorkerId worker, dcd::NodeId node,
+                            dcd::CacheId cache, dcd::CacheEntryId entry, dcd::ReplicaId replica,
+                            dcd::LocationId location, const std::string& tag) {
+  dcd::WorkerSession s; s.boot = boot; s.worker = worker; s.node = node; s.tag = tag;
+  bool ok = dir.register_worker_session(s).ok;
+  dcd::CacheDescriptor c; c.cache_id = cache; c.kind = dcd::CacheKind::PROCESS_LOCAL; c.node = node; c.worker = worker; c.worker_boot = boot;
+  c.domain = dcd::MemoryDomain::HOST_MEMORY; c.reachability = dcd::Reachability::REACHABLE; c.health = dcd::Health::HEALTHY; c.freshness = dcd::Freshness::CURRENT;
+  c.authority = env(dir, boot, 1);
+  ok = dir.register_cache(c).ok && ok;
+  dcd::LocationDescriptor l; l.location_id = location; l.node = node; l.worker = worker; l.worker_boot = boot;
+  l.domain = dcd::MemoryDomain::HOST_MEMORY; l.locator.key = "host:/holder/" + std::to_string(boot.value()); l.logical_bytes = 4096; l.process_tag = tag;
+  l.reachability = dcd::Reachability::REACHABLE; l.health = dcd::Health::HEALTHY; l.freshness = dcd::Freshness::CURRENT; l.integrity = dcd::Integrity::VERIFIED;
+  l.authority = env(dir, boot, 1);
+  ok = dir.register_location(l).ok && ok;
+  dcd::ReplicaDescriptor rep; rep.replica_id = replica; rep.location = location; rep.cache = cache; rep.entry = entry;
+  rep.reachability = dcd::Reachability::REACHABLE; rep.health = dcd::Health::HEALTHY; rep.integrity = dcd::Integrity::VERIFIED; rep.freshness = dcd::Freshness::CURRENT;
+  rep.authority = env(dir, boot, 1);
+  ok = dir.register_replica(rep).ok && ok;
+  return ok;
+}
+
+// A current, verified record for a holder registered with register_holder.
+inline dcd::DirectoryRecord holder_record(const dcd::Directory& dir, dcd::StateId state, dcd::StateGeneration gen,
+                                          dcd::WorkerBootId boot, dcd::WorkerId worker, dcd::NodeId node,
+                                          dcd::CacheId cache, dcd::CacheEntryId entry, dcd::ReplicaId replica,
+                                          dcd::LocationId location) {
+  dcd::DirectoryRecord r;
+  r.state_id = state; r.state_generation = gen; r.kind = dcd::StateKind::TENSOR_STATE;
+  r.cache = cache; r.entry = entry; r.replica = replica; r.location = location;
+  r.node = node; r.worker = worker; r.worker_boot = boot;
+  r.domain = dcd::MemoryDomain::HOST_MEMORY; r.logical_bytes = 4096;
+  r.reachability = dcd::Reachability::REACHABLE; r.health = dcd::Health::HEALTHY;
+  r.freshness = dcd::Freshness::CURRENT; r.integrity = dcd::Integrity::VERIFIED;
+  r.authority = env(dir, boot, 1);
+  return r;
+}
+
 }  // namespace tst

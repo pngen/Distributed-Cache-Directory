@@ -33,5 +33,14 @@ int main() {
   auto rp = serialize_record(rec0); dcd::DirectoryRecord r2;
   DCD_CHECK(deserialize_record(rp, r2));
   DCD_CHECK(r2.state_id == rec0.state_id && r2.replica == rec0.replica && r2.domain == rec0.domain && r2.state_generation == rec0.state_generation && r2.logical_bytes == rec0.logical_bytes);
+  // ---- regression: every message kind is a valid frame kind ----
+  for (MessageKind k : {MessageKind::REGISTER_LOCATION, MessageKind::REGISTER_REPLICA}) {
+    auto fr = encode_frame(k, payload); Frame f3; std::string e3; std::size_t c3 = 0;
+    DCD_CHECK_MSG(decode_frame(fr, f3, e3, c3), std::string(to_string(k)) + ": " + e3);
+    DCD_CHECK(f3.kind == k);
+    DCD_CHECK(f3.payload == payload);
+  }
+  // A kind beyond the last enumerator is still rejected (the kind byte follows magic and version).
+  { auto b = frame; b[8] = 19; Frame f2; std::string e2; std::size_t c2; DCD_CHECK(!decode_frame(b, f2, e2, c2)); DCD_CHECK(e2.find("invalid enum") != std::string::npos); }
   return dcdtest::summary("test_protocol");
 }

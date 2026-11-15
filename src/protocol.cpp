@@ -132,7 +132,7 @@ bool decode_frame(std::span<const std::uint8_t> bytes, Frame& out, std::string& 
   if (!rd.u32(ver)) { err = "truncation: version"; return false; }
   if (ver != FRAME_VERSION) { err = "unsupported version"; return false; }
   if (!rd.u8(kind)) { err = "truncation: kind"; return false; }
-  if (kind > static_cast<std::uint8_t>(MessageKind::ERROR)) { err = "invalid enum"; return false; }
+  if (kind > static_cast<std::uint8_t>(MessageKind::REGISTER_REPLICA)) { err = "invalid enum"; return false; }
   if (!rd.u32(len)) { err = "truncation: length"; return false; }
   if (len > MAX_PAYLOAD) { err = "oversized payload"; return false; }
   if (!rd.u32(crc)) { err = "truncation: crc"; return false; }

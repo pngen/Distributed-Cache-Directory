@@ -2,12 +2,14 @@
 #include "distributedcachedirectory/digest.hpp"
 #include "distributedcachedirectory/persistence.hpp"
 #include "distributedcachedirectory/serde.hpp"
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -250,11 +252,20 @@ Result<AckResult> Directory::save_to_buffer(std::vector<std::uint8_t>& out) cons
   body.u64(records_.size()); body.u64(caches_.size()); body.u64(locations_.size()); body.u64(replicas_.size());
   body.u64(leases_.size()); body.u64(tombstones_.size()); body.u64(observations_.size());
   body.u64(epoch_.value()); body.u64(directory_generation_.value());
+  // Canonical order: descriptors are written by identity, never in hash-bucket
+  // order, so equal directory state always encodes to the same bytes.
+  const auto by_id = [](const auto& map) {
+    std::vector<typename std::remove_reference_t<decltype(map)>::const_pointer> v;
+    v.reserve(map.size());
+    for (const auto& kv : map) v.push_back(&kv);
+    std::sort(v.begin(), v.end(), [](const auto* a, const auto* b) { return a->first < b->first; });
+    return v;
+  };
   for (const auto& r : records_) w_rec(body, r);
-  for (const auto& kv : caches_) w_cache(body, kv.second);
-  for (const auto& kv : locations_) w_loc(body, kv.second);
-  for (const auto& kv : replicas_) w_rep(body, kv.second);
-  for (const auto& kv : leases_) w_lease(body, kv.second);
+  for (const auto* kv : by_id(caches_)) w_cache(body, kv->second);
+  for (const auto* kv : by_id(locations_)) w_loc(body, kv->second);
+  for (const auto* kv : by_id(replicas_)) w_rep(body, kv->second);
+  for (const auto* kv : by_id(leases_)) w_lease(body, kv->second);
   for (const auto& t : tombstones_) w_tomb(body, t);
   for (const auto& o : observations_) w_obs(body, o);
 
@@ -401,9 +412,12 @@ Result<AckResult> Directory::recover_from_buffer(const std::vector<std::uint8_t>
   for (auto& recv : records_) {
     if (is_process_local(recv.domain)) { recv.freshness = Freshness::REVALIDATION_REQUIRED; recv.reachability = Reachability::REVALIDATION_REQUIRED; }
     else { recv.freshness = Freshness::STALE; recv.reachability = Reachability::REVALIDATION_REQUIRED; }
-    recv.lifecycle = (recv.integrity == Integrity::CORRUPT) ? LifecycleState::FAILED
-                 : (recv.reachability == Reachability::UNREACHABLE) ? LifecycleState::UNREACHABLE
-                 : LifecycleState::STALE;
+    // Only current records await revalidation; a superseded, invalidated or
+    // tombstoned record keeps the lifecycle that made it historical.
+    if (recv.current)
+      recv.lifecycle = (recv.integrity == Integrity::CORRUPT) ? LifecycleState::FAILED
+                     : (recv.reachability == Reachability::UNREACHABLE) ? LifecycleState::UNREACHABLE
+                     : LifecycleState::STALE;
     recompute_record_digest(recv);
     ++reval;
   }
@@ -418,6 +432,8 @@ Result<AckResult> Directory::recover_from_buffer(const std::vector<std::uint8_t>
   for (const auto& recv : records_) if (recv.current) { auto it = current_state_gen_.find(recv.state_id); if (it == current_state_gen_.end() || it->second.value() < recv.state_generation.value()) current_state_gen_[recv.state_id] = recv.state_generation; }
   epoch_ = CoordinatorEpoch(epoch + 1);
   directory_generation_ = DirectoryGeneration(dirgen);
+  // Record ids named by the recovered state are never assigned again.
+  for (const auto& recv : records_) if (recv.record_id.value() >= next_obj_) next_obj_ = recv.record_id.value() + 1;
   indexes_dirty_ = true;
   recompute_accounting();
   AckResult a; a.ok = true; a.message = "recovered " + std::to_string(records_.size()) + " records; " + std::to_string(reval) + " locations flagged revalidation";
