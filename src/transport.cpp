@@ -39,6 +39,17 @@ void TcpStream::close() {
     sock_ = ~0ull;
   }
 }
+void TcpStream::interrupt() const {
+  if (sock_ == ~0ull) return;
+#ifdef DCD_WSA
+  ::shutdown((SOCKET)sock_, SD_BOTH);
+  // shutdown() only fails the calls that follow it. A read that is already
+  // blocked is ended by cancelling it.
+  ::CancelIoEx(reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(sock_)), nullptr);
+#else
+  ::shutdown(sock_, SHUT_RDWR);
+#endif
+}
 bool TcpStream::blocking_read_exact(std::uint8_t* buf, std::size_t n) {
   std::size_t got = 0;
   while (got < n) {

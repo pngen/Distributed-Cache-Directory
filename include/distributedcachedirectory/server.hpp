@@ -2,9 +2,12 @@
 #include "directory.hpp"
 #include "transport.hpp"
 #include "protocol.hpp"
+#include <atomic>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace distributedcachedirectory {
@@ -30,12 +33,26 @@ class CoordinatorServer {
   void respond_ack(transport::FrameChannel& ch, const AckResult& a);
   void respond_error(transport::FrameChannel& ch, DirectoryError e, const std::string& m);
 
+  // Handler threads started by run(). Each lists the channel it serves in
+  // live_channels_ while it runs. stop() interrupts every listed channel and
+  // joins every thread, so no handler outlives the server it works on.
+  struct Connection {
+    std::thread thread;
+    std::atomic<bool> done{false};
+  };
+  // Joins and drops the handler threads that have finished.
+  void reap_finished_locked();
+
   std::shared_ptr<Directory> dir_;
   transport::TcpListener listener_;
   std::mutex dir_mutex_;
   std::string persist_path_;
-  bool running_{false};
+  std::atomic<bool> running_{false};
   unsigned short port_{0};
+  std::mutex conn_mutex_;
+  std::list<Connection> connections_;
+  std::vector<transport::FrameChannel*> live_channels_;
+  bool stopping_{false};
 };
 
 }  // namespace server

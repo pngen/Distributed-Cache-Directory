@@ -1,4 +1,5 @@
 #include "distributedcachedirectory/server.hpp"
+#include <algorithm>
 #include <filesystem>
 #include <thread>
 #include <utility>
@@ -17,6 +18,10 @@ bool CoordinatorServer::start(unsigned short port, const std::string& persist_pa
   }
   if (!listener_.bind("0.0.0.0", port, err)) return false;
   port_ = listener_.port();
+  {
+    std::lock_guard<std::mutex> lock(conn_mutex_);
+    stopping_ = false;
+  }
   running_ = true;
   return true;
 }
@@ -28,13 +33,44 @@ void CoordinatorServer::run() {
     std::string err;
     auto s = listener_.accept(err);
     if (!s) { if (!running_) break; continue; }
-    std::thread([this, stream = std::move(*s)]() mutable { handle_connection(std::move(stream)); }).detach();
+    std::lock_guard<std::mutex> lock(conn_mutex_);
+    if (stopping_) break;
+    reap_finished_locked();
+    connections_.emplace_back();
+    Connection& slot = connections_.back();
+    slot.thread = std::thread([this, &slot, stream = std::move(*s)]() mutable {
+      handle_connection(std::move(stream));
+      slot.done = true;
+    });
+  }
+}
+
+void CoordinatorServer::reap_finished_locked() {
+  for (auto it = connections_.begin(); it != connections_.end();) {
+    if (it->done.load()) {
+      it->thread.join();
+      it = connections_.erase(it);
+    } else {
+      ++it;
+    }
   }
 }
 
 void CoordinatorServer::stop() {
   running_ = false;
   listener_.close();
+  std::list<Connection> handlers;
+  {
+    std::lock_guard<std::mutex> lock(conn_mutex_);
+    stopping_ = true;
+    // A handler may be blocked reading from a worker that stays silent. End
+    // that read, or the join below would wait on the worker.
+    for (transport::FrameChannel* live : live_channels_) live->stream().interrupt();
+    handlers.swap(connections_);
+  }
+  for (Connection& handler : handlers) {
+    if (handler.thread.joinable()) handler.thread.join();
+  }
 }
 
 void CoordinatorServer::respond_ack(transport::FrameChannel& ch, const AckResult& a) {
@@ -46,6 +82,11 @@ void CoordinatorServer::respond_error(transport::FrameChannel& ch, DirectoryErro
 
 void CoordinatorServer::handle_connection(transport::TcpStream&& stream) {
   transport::FrameChannel ch(std::move(stream));
+  {
+    std::lock_guard<std::mutex> lock(conn_mutex_);
+    if (stopping_) return;
+    live_channels_.push_back(&ch);
+  }
   WorkerBootId boot; bool have_boot = false;
   while (true) {
     std::uint8_t kind = 0; std::vector<std::uint8_t> payload; std::string err;
@@ -165,6 +206,8 @@ void CoordinatorServer::handle_connection(transport::TcpStream&& stream) {
       default: respond_error(ch, DirectoryError::PROTOCOL_VIOLATION, "unknown message kind");
     }
   }
+  std::lock_guard<std::mutex> lock(conn_mutex_);
+  live_channels_.erase(std::find(live_channels_.begin(), live_channels_.end(), &ch));
 }
 
 }  // namespace server

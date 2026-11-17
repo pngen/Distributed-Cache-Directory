@@ -26,6 +26,9 @@ class TcpStream {
   bool blocking_read_exact(std::uint8_t* buf, std::size_t n);
   bool blocking_write_all(const std::uint8_t* buf, std::size_t n);
   void close();
+  // Fails a read or write that another thread has blocked on this stream, and
+  // every later one. The stream stays open: only its owner closes it.
+  void interrupt() const;
   unsigned long long native() const { return sock_; }
 
  private:
